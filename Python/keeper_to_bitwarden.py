@@ -2,13 +2,20 @@
 """
 Keeper to Bitwarden Migration Script
 
-This script migrates data from a Keeper password manager JSON export to Bitwarden
-using the Bitwarden CLI. It handles:
+This script migrates data from a Keeper password manager JSON export to Bitwarden.
+It handles:
 - Authentication (login/unlock)
 - Org-collection creation from shared folders
 - Folder creation
 - Item migration with proper type mapping
 - File attachments
+
+Usage:
+    # Direct import to personal vault (uses Bitwarden CLI)
+    python3 keeper_to_bitwarden.py export.json
+
+    # Export to Bitwarden JSON (individual vault, no authentication required)
+    python3 keeper_to_bitwarden.py export.json --export -o output.json
 """
 
 import json
@@ -17,6 +24,7 @@ import sys
 import getpass
 import time
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Any
 from pathlib import Path
@@ -63,13 +71,14 @@ class BitwardenAuth:
 
     def _login(self) -> str:
         """Perform initial login to Bitwarden"""
+        email = input("Enter your Bitwarden email address: ").strip()
         master_password = getpass.getpass("Enter your Bitwarden master password: ")
 
         # Use environment variable to pass password (avoids stdin issues)
         env = {**subprocess.os.environ, 'BW_PASSWORD': master_password}
 
         result = subprocess.run(
-            ['bw', 'login', '--passwordenv', 'BW_PASSWORD', '--raw'],
+            ['bw', 'login', email, '--passwordenv', 'BW_PASSWORD', '--raw'],
             capture_output=True,
             text=True,
             env=env
@@ -128,7 +137,7 @@ class BitwardenAuth:
 class KeeperToBitwardenMigration:
     """Main migration class"""
 
-    def __init__(self, keeper_export_path: str, attachments_dir: str, session_key: str, max_workers: int = 5):
+    def __init__(self, keeper_export_path: str, attachments_dir: str, session_key: Optional[str] = None, max_workers: int = 5):
         self.keeper_export_path = Path(keeper_export_path)
         self.attachments_dir = Path(attachments_dir)
         self.session_key = session_key
@@ -523,12 +532,19 @@ class KeeperToBitwardenMigration:
             print(f"  ⚠️  Failed to calculate SSH fingerprint: {e}")
             return None
 
-    def create_bitwarden_item(self, record: Dict[str, Any]) -> Optional[str]:
-        """Create a Bitwarden item from a Keeper record"""
+    def build_item_dict(self, record: Dict[str, Any], folder_id_map: Optional[Dict[str, str]] = None) -> Dict:
+        """
+        Convert a Keeper record to a Bitwarden item dict without any CLI calls.
+
+        folder_id_map: optional mapping of folder path -> folder ID. When provided
+                       (e.g. for export mode with generated UUIDs) it takes precedence
+                       over self.folder_map. Shared-folder/collection assignment is
+                       intentionally skipped here — handle it in create_bitwarden_item
+                       when a live session is available.
+        """
         keeper_type = record.get('$type', 'login')
         bw_type = self.map_keeper_type_to_bitwarden(keeper_type)
 
-        # Base item structure
         item = {
             "organizationId": None,
             "collectionIds": [],
@@ -546,24 +562,12 @@ class KeeperToBitwardenMigration:
             "reprompt": 0
         }
 
-        # Handle folders and collections
-        folders = record.get('folders', [])
-        for folder_def in folders:
-            # Check for shared folder (collection)
-            shared_folder = folder_def.get('shared_folder')
-            if shared_folder and shared_folder in self.shared_folder_map:
-                collection_id = self.shared_folder_map[shared_folder]
-                item['collectionIds'].append(collection_id)
-                # Get org ID from first collection
-                if not item['organizationId']:
-                    orgs = self.run_bw_command(['list', 'organizations'])
-                    if orgs and len(orgs) > 0:
-                        item['organizationId'] = orgs[0]['id']
-
-            # Check for personal folder
+        # Assign personal folder ID
+        _folder_map = folder_id_map if folder_id_map is not None else self.folder_map
+        for folder_def in record.get('folders', []):
             folder_path = folder_def.get('folder')
-            if folder_path and folder_path in self.folder_map:
-                item['folderId'] = self.folder_map[folder_path]
+            if folder_path and folder_path in _folder_map:
+                item['folderId'] = _folder_map[folder_path]
 
         # Type-specific handling
         if keeper_type == 'login' or bw_type == 1:
@@ -574,51 +578,36 @@ class KeeperToBitwardenMigration:
                 "uris": []
             }
 
-            # Add URI if present
             login_url = record.get('login_url', '')
             if login_url:
-                item['login']['uris'] = [{
-                    "match": None,
-                    "uri": login_url
-                }]
+                item['login']['uris'] = [{"match": None, "uri": login_url}]
 
-            # Handle TOTP ($oneTimeCode)
             custom_fields = record.get('custom_fields', {})
             otp_code = custom_fields.get('$oneTimeCode')
             if otp_code:
-                # Handle both string and array
                 if isinstance(otp_code, list):
-                    otp_code = otp_code[0]  # Take first one
-
+                    otp_code = otp_code[0]
                 totp_secret = self.extract_totp_secret(otp_code)
                 if totp_secret:
                     item['login']['totp'] = totp_secret
 
         elif keeper_type == 'sshKeys':
-            # SSH keys - use dedicated sshKey type
             custom_fields = record.get('custom_fields', {})
             key_pair = custom_fields.get('$keyPair', {})
-
             private_key = key_pair.get('privateKey', '')
             public_key = key_pair.get('publicKey', '')
 
-            # Only create SSH key if we have actual key data
             if private_key and public_key:
-                # Calculate the SSH key fingerprint
-                fingerprint = self.calculate_ssh_fingerprint(public_key)
-
                 item['sshKey'] = {
                     "privateKey": private_key,
                     "publicKey": public_key,
-                    "keyFingerprint": fingerprint
+                    "keyFingerprint": self.calculate_ssh_fingerprint(public_key)
                 }
             else:
-                # No SSH key data - convert to secure note instead
                 item['type'] = 2
                 item['secureNote'] = {"type": 0}
 
         elif keeper_type == 'bankCard':
-            # Credit card
             custom_fields = record.get('custom_fields', {})
             payment_card = custom_fields.get('$paymentCard', {})
 
@@ -631,7 +620,6 @@ class KeeperToBitwardenMigration:
                 "code": payment_card.get('cardSecurityCode', '')
             }
 
-            # Parse expiration date (format: MM/YYYY)
             exp_date = payment_card.get('cardExpirationDate', '')
             if '/' in exp_date:
                 parts = exp_date.split('/')
@@ -640,7 +628,6 @@ class KeeperToBitwardenMigration:
                     item['card']['expYear'] = parts[1]
 
         elif keeper_type in ['address', 'contact']:
-            # Identity
             custom_fields = record.get('custom_fields', {})
             address = custom_fields.get('$address', {})
             name = custom_fields.get('$name', {})
@@ -666,17 +653,12 @@ class KeeperToBitwardenMigration:
             }
 
         else:
-            # Everything else as secure note
             item['secureNote'] = {"type": 0}
 
-        # Handle custom fields (other than special types already processed)
+        # Custom fields
         custom_fields = record.get('custom_fields', {})
-        has_passkey = False
-
         for key, value in custom_fields.items():
-            # Handle passkeys - add warning note and track for report
             if key == '$passkey':
-                has_passkey = True
                 if item['notes']:
                     item['notes'] += "\n\n"
                 item['notes'] += "⚠️ PASSKEY WAS NOT TRANSFERRED\n"
@@ -684,27 +666,38 @@ class KeeperToBitwardenMigration:
                 item['notes'] += "You will need to re-enroll this passkey in Bitwarden."
                 continue
 
-            # Skip already processed fields
             if key in ['$oneTimeCode', '$keyPair', '$paymentCard', '$address', '$name', '$email', '$phone', '$note']:
                 continue
 
-            # Extract field name and type from key (format: $type:name)
             field_name = key
-            field_type = 0  # text
-
+            field_type = 0
             if ':' in key:
                 parts = key.split(':', 1)
                 field_name = parts[1]
                 if 'pinCode' in parts[0]:
-                    field_type = 1  # hidden
+                    field_type = 1
 
-            item['fields'].append({
-                "name": field_name,
-                "value": str(value),
-                "type": field_type
-            })
+            item['fields'].append({"name": field_name, "value": str(value), "type": field_type})
 
-        # Create the item with retry logic
+        return item
+
+    def create_bitwarden_item(self, record: Dict[str, Any]) -> Optional[str]:
+        """Create a Bitwarden item from a Keeper record via the CLI"""
+        item = self.build_item_dict(record)
+
+        # Handle shared folders (collections) — requires live session
+        for folder_def in record.get('folders', []):
+            shared_folder = folder_def.get('shared_folder')
+            if shared_folder and shared_folder in self.shared_folder_map:
+                collection_id = self.shared_folder_map[shared_folder]
+                item['collectionIds'].append(collection_id)
+                if not item['organizationId']:
+                    orgs = self.run_bw_command(['list', 'organizations'])
+                    if orgs and len(orgs) > 0:
+                        item['organizationId'] = orgs[0]['id']
+
+        has_passkey = '$passkey' in record.get('custom_fields', {})
+
         result = self.run_bw_command_with_retry(
             ['create', 'item'],
             input_data=json.dumps(item),
@@ -713,13 +706,49 @@ class KeeperToBitwardenMigration:
 
         if result and 'error' not in result:
             item_id = result.get('id')
-
-            # Track items with passkeys for report (store raw Keeper record)
             if has_passkey:
                 self.passkey_items.append(record)
-
             return item_id
         return None
+
+    def convert_to_bitwarden_json(self) -> Dict:
+        """
+        Convert all Keeper records to a Bitwarden JSON structure for individual
+        vault import. No Bitwarden CLI authentication is required.
+
+        Returns a dict matching Bitwarden's import format:
+            {"encrypted": false, "folders": [...], "items": [...]}
+        """
+        # Collect all unique personal folder paths
+        folder_paths: set = set()
+        for record in self.keeper_data.get('records', []):
+            for folder_def in record.get('folders', []):
+                path = folder_def.get('folder')
+                if path:
+                    folder_paths.add(path)
+
+        # Assign stable UUIDs to each folder
+        folder_id_map: Dict[str, str] = {path: str(uuid.uuid4()) for path in sorted(folder_paths)}
+        folders = [{"id": fid, "name": path} for path, fid in folder_id_map.items()]
+
+        # Convert records to Bitwarden item dicts
+        records = self.keeper_data.get('records', [])
+        total = len(records)
+        items = []
+        for idx, record in enumerate(records, 1):
+            title = record.get('title', 'Untitled')
+            print(f"[{idx}/{total}] Converting: {title}")
+            try:
+                items.append(self.build_item_dict(record, folder_id_map=folder_id_map))
+            except Exception as e:
+                print(f"  Warning: Failed to convert '{title}': {e}")
+
+        print(f"\nConversion complete: {len(folders)} folders, {len(items)} items")
+        return {
+            "encrypted": False,
+            "folders": folders,
+            "items": items
+        }
 
     def create_bitwarden_item_with_retry(self, record: Dict[str, Any]) -> Optional[str]:
         """Create a Bitwarden item with rate limit aware retry logic"""
@@ -997,8 +1026,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Parallel migration (default, 5 workers)
+  # Direct import to personal vault (uses Bitwarden CLI)
   python3 keeper_to_bitwarden.py export.json
+
+  # Export to JSON file for personal vault (no authentication required)
+  python3 keeper_to_bitwarden.py export.json --export -o personal.json
 
   # Sequential migration (slower, but uses less memory)
   python3 keeper_to_bitwarden.py export.json --sequential
@@ -1013,6 +1045,21 @@ Examples:
     parser.add_argument(
         'export_file',
         help='Path to Keeper JSON export file'
+    )
+    parser.add_argument(
+        '--export',
+        action='store_true',
+        help='Export to Bitwarden JSON file for individual vault (no authentication required)'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='bitwarden-import.json',
+        help='Output JSON file path (default: bitwarden-import.json). Only used with --export'
+    )
+    parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Output compact JSON (single line) instead of pretty-printed. Only used with --export'
     )
     parser.add_argument(
         '--attachments-dir',
@@ -1033,24 +1080,44 @@ Examples:
 
     args = parser.parse_args()
 
-    # Authenticate with Bitwarden
-    print("Authenticating with Bitwarden...")
-    auth = BitwardenAuth()
-    session_key = auth.authenticate()
+    if args.export:
+        # Export mode: convert to JSON without authenticating
+        print("\n=== Individual Vault Export Mode ===")
+        migration = KeeperToBitwardenMigration(
+            keeper_export_path=args.export_file,
+            attachments_dir=args.attachments_dir,
+            max_workers=args.workers
+        )
+        bitwarden_data = migration.convert_to_bitwarden_json()
 
-    # Run migration
-    migration = KeeperToBitwardenMigration(
-        keeper_export_path=args.export_file,
-        attachments_dir=args.attachments_dir,
-        session_key=session_key,
-        max_workers=args.workers
-    )
+        print(f"\nWriting output to: {args.output}")
+        with open(args.output, 'w', encoding='utf-8') as f:
+            if args.compact:
+                json.dump(bitwarden_data, f, ensure_ascii=False)
+            else:
+                json.dump(bitwarden_data, f, indent=2, ensure_ascii=False)
 
-    try:
-        migration.migrate(use_parallel=not args.sequential)
-    finally:
-        # Always clean up sensitive data
-        migration.cleanup()
+        print(f"\nSuccess! Import into Bitwarden using:")
+        print(f"  bw import bitwardenjson {args.output}")
+
+    else:
+        # Direct import mode: authenticate and import via CLI
+        print("\n=== Direct Import Mode (Personal Vault) ===")
+        print("Authenticating with Bitwarden...")
+        auth = BitwardenAuth()
+        session_key = auth.authenticate()
+
+        migration = KeeperToBitwardenMigration(
+            keeper_export_path=args.export_file,
+            attachments_dir=args.attachments_dir,
+            session_key=session_key,
+            max_workers=args.workers
+        )
+
+        try:
+            migration.migrate(use_parallel=not args.sequential)
+        finally:
+            migration.cleanup()
 
 
 if __name__ == '__main__':
