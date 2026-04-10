@@ -178,6 +178,28 @@ DEVICE_TYPES: dict[int, str] = {
     26: "Server",
 }
 
+# Device → access channel grouping
+ACCESS_CHANNEL: dict[int, str] = {
+    0: "Mobile",   1: "Mobile",  15: "Mobile",
+    2: "Extension", 3: "Extension", 4: "Extension",
+    5: "Extension", 17: "Extension", 18: "Extension",
+    6: "Desktop",  7: "Desktop",  8: "Desktop",  16: "Desktop",
+    9: "Web",     10: "Web",    11: "Web",    12: "Web",
+   13: "Web",     14: "Web",    19: "Web",    20: "Web",
+   25: "Backend API", 26: "Backend API",
+}
+
+# Device → browser brand (extensions + browsers both count toward brand)
+BROWSER_BRAND: dict[int, str] = {
+    2: "Chrome",   9: "Chrome",
+    3: "Firefox", 10: "Firefox",
+    4: "Opera",   11: "Opera",
+    5: "Edge",    12: "Edge",
+   13: "IE",
+   17: "Safari",  20: "Safari",
+   18: "Vivaldi", 19: "Vivaldi",
+}
+
 MEMBER_STATUS: dict[int, str] = {
     -1: "Revoked",
     0: "Invited",
@@ -466,6 +488,8 @@ def compute_metrics(
     device_sets: dict[str, set[str]] = defaultdict(set)
     active_user_ids: set[str] = set()          # Bitwarden account UUIDs with a login event
     device_totals: dict[str, int] = defaultdict(int)
+    channel_totals: dict[str, int] = defaultdict(int)
+    browser_totals: dict[str, int] = defaultdict(int)
 
     for event in events:
         uid: Optional[str] = event.get("actingUserId")
@@ -488,6 +512,12 @@ def compute_metrics(
         if device_code is not None:
             device_sets[uid].add(device_label)
             device_totals[device_label] += 1
+            channel = ACCESS_CHANNEL.get(device_code)
+            if channel:
+                channel_totals[channel] += 1
+            brand = BROWSER_BRAND.get(device_code)
+            if brand:
+                browser_totals[brand] += 1
 
         if etype == EVENT_LOGIN:
             login_counts[uid] += 1
@@ -538,6 +568,16 @@ def compute_metrics(
             "group_count": len(g_names),
             "group_names": "; ".join(g_names),
         }
+
+    # ---- Pending invitations by group ----
+    pending_by_group: dict[str, int] = {}
+    for group_id, org_member_ids in group_members_map.items():
+        group_name = group_name_by_id.get(group_id, group_id)
+        count = sum(
+            1 for oid in org_member_ids
+            if member_by_org_id.get(oid, {}).get("status") in (0, 1)
+        )
+        pending_by_group[group_name] = count
 
     # ---- Org-level summary ----
     total_members = len(members)
@@ -595,7 +635,22 @@ def compute_metrics(
         "Top Device Types (by event volume)": top_devices_str,
     }
 
-    return org_summary, per_member
+    # Access channel share
+    total_channel_events = sum(channel_totals.values())
+    for channel in ("Web", "Desktop", "Mobile", "Extension", "Backend API"):
+        count = channel_totals.get(channel, 0)
+        org_summary[f"Access Channel: {channel} (events)"] = count
+        org_summary[f"Access Channel: {channel} %"] = _pct(count, total_channel_events)
+
+    # Browser brand share
+    total_browser_events = sum(browser_totals.values())
+    for brand in ("Chrome", "Edge", "Safari", "Firefox", "Opera", "Vivaldi", "IE"):
+        count = browser_totals.get(brand, 0)
+        if count:
+            org_summary[f"Browser Usage: {brand} (events)"] = count
+            org_summary[f"Browser Usage: {brand} %"] = _pct(count, total_browser_events)
+
+    return org_summary, per_member, pending_by_group
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +661,7 @@ def write_csv(
     output_prefix: str,
     org_summary: dict,
     per_member: dict[str, dict],
+    pending_by_group: dict[str, int],
     days: int,
 ) -> tuple[str, str]:
     date_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -634,6 +690,12 @@ def write_csv(
         writer.writerow(["Metric", "Value"])
         for k, v in org_summary.items():
             writer.writerow([k, v])
+        if pending_by_group:
+            writer.writerow([])
+            writer.writerow(["--- Pending Invitations by Group ---", ""])
+            writer.writerow(["Group", "Pending (Invited + Accepted)"])
+            for group_name, count in sorted(pending_by_group.items()):
+                writer.writerow([group_name, count])
 
     # Members: one row per member
     active_col = f"Active (Last {days} Days)"
@@ -1160,13 +1222,13 @@ Non-interactive usage (set env vars to skip the setup wizard):
     events = client.get_all_events(start, end)
 
     with Spinner("Computing metrics") as sp:
-        org_summary, per_member = compute_metrics(
+        org_summary, per_member, pending_by_group = compute_metrics(
             members, groups, group_members_map, events, policies, subscription, args.days
         )
         sp.done()
 
     with Spinner("Writing CSV files") as sp:
-        summary_path, members_path = write_csv(args.output, org_summary, per_member, args.days)
+        summary_path, members_path = write_csv(args.output, org_summary, per_member, pending_by_group, args.days)
         sp.done()
 
     _print_summary_table(org_summary, args.days, region_label, summary_path, members_path)
