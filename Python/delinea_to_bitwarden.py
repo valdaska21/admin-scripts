@@ -72,13 +72,14 @@ class BitwardenAuth:
 
     def _login(self) -> str:
         """Perform initial login to Bitwarden"""
+        email = input("Enter your Bitwarden email address: ").strip()
         master_password = getpass.getpass("Enter your Bitwarden master password: ")
 
         # Use environment variable to pass password (avoids stdin issues)
         env = {**subprocess.os.environ, 'BW_PASSWORD': master_password}
 
         result = subprocess.run(
-            ['bw', 'login', '--passwordenv', 'BW_PASSWORD', '--raw'],
+            ['bw', 'login', email, '--passwordenv', 'BW_PASSWORD', '--raw'],
             capture_output=True,
             text=True,
             env=env
